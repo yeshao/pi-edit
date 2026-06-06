@@ -1,0 +1,7 @@
+# Dependencies
+node_modules/
+
+# BugFind internal files
+.bugfind/
+prompts/
+BUGFIND_REPORT.md

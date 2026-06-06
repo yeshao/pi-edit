@@ -1,0 +1,4 @@
+# Internal development files
+.bugfind/
+prompts/
+BUGFIND_REPORT.md
