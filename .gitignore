@@ -1,2 +1,5 @@
 node_modules/
 *.tsbuildinfo
+CODE_REVIEW*.md
+REVIEW_FINDINGS.md
+TODO.md
