@@ -33,15 +33,6 @@ import { resolve } from "node:path";
 const NON_FILE_TARGET = /^(?:\/dev\/|\/proc\/|\/sys\/|\/tmp\/|\/var\/tmp\/)/;
 
 /**
- * Strip a single layer of surrounding quotes (single or double) from a string.
- * Leaves the string unchanged if it is not fully wrapped in matching quotes.
- */
-function unquote(s: string): string {
-	const m = s.length >= 2 && s[0] === s[s.length - 1] && (s[0] === "'" || s[0] === '"');
-	return m ? s.slice(1, -1) : s;
-}
-
-/**
  * Remove quoted substrings (single- or double-quoted) from a command string,
  * replacing them with an equal-length run of spaces. This prevents redirect
  * operators *inside* a quoted string (e.g. `echo "a > b"`) from being
