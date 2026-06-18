@@ -4,12 +4,10 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "declaration": true,
-    "sourceMap": true
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["./types/pi-coding-agent"]
+    }
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src", "types"]
 }

@@ -1,8 +1,8 @@
 {
   "name": "pi-edit",
   "version": "0.1.0",
+  "description": "Claude Code-style editing discipline for Pi \u2014 read-before-write, TOCTOU protection, bash steering, post-edit diagnostics, schema-error recovery",
   "type": "module",
-  "description": "Claude Code-style editing discipline for Pi — read-before-write, TOCTOU protection, bash steering, post-edit diagnostics",
   "main": "./src/index.ts",
   "pi": {
     "extensions": [
@@ -11,7 +11,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest --run"
+    "test": "vitest run"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
@@ -20,8 +20,9 @@
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "vitest": "^3.2.4"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
   },
   "engines": {
     "node": ">=18.0.0"

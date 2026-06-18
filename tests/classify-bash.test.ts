@@ -13,6 +13,8 @@ import { describe, it, expect } from "vitest";
  */
 
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { resolve } from "node:path";
 
 // ---------------------------------------------------------------------------
 // classifyBash — deterministic, no filesystem needed
@@ -25,28 +27,116 @@ import { readFileSync } from "node:fs";
  * This mirrors the logic in src/index.ts exactly — if the implementation
  * changes, this test file must be updated to match.
  */
+const NON_FILE_TARGET = /^(?:\/dev\/|\/proc\/|\/sys\/|\/tmp\/|\/var\/tmp\/)/;
 
-const NON_FILE_TARGET = /^(?:\/dev\/|\/proc\/|\/sys\/)/;
-const FILE_REDIRECT = />>?\s*([^&\s][^\s|;&]*\.\w+)/;
-const FILE_TEE = /\btee\b\s+(?:-a\s+)?([^\s|;&]*\.\w+)/;
+/**
+ * Strip a single layer of surrounding quotes (single or double) from a string.
+ * Leaves the string unchanged if it is not fully wrapped in matching quotes.
+ */
+function unquote(s: string): string {
+	const m = s.length >= 2 && s[0] === s[s.length - 1] && (s[0] === "'" || s[0] === '"');
+	return m ? s.slice(1, -1) : s;
+}
 
-const MUTATING_BASH: { re: RegExp; hint: string; targetGroup?: number }[] = [
-	{ re: /\bsed\b[^|]*\s-[a-z]*i/, hint: "in-place sed edit" },
-	{ re: /\bawk\b[^|]*>\s*[^&\s]/, hint: "awk redirect to file" },
-	{ re: /\bperl\b[^|]*\s-[a-z]*i/, hint: "perl -i in-place edit" },
-	{ re: FILE_REDIRECT, hint: "shell redirect into a file", targetGroup: 1 },
-	{ re: FILE_TEE, hint: "tee into a file", targetGroup: 1 },
+/**
+ * Remove quoted substrings (single- or double-quoted) from a command string,
+ * replacing them with an equal-length run of spaces. This prevents redirect
+ * operators *inside* a quoted string (e.g. `echo "a > b"`) from being
+ * matched, while preserving the positions of real redirects outside quotes.
+ */
+function stripQuotedStrings(command: string): string {
+	return command
+		.replace(/"(?:[^"\\]|\\.)*"/g, (m) => " ".repeat(m.length))
+		.replace(/'(?:[^'\\]|\\.)*'/g, (m) => " ".repeat(m.length));
+}
+
+interface ExtractedTarget {
+	target: string;
+	operator: ">" | ">>" | "tee";
+}
+
+function extractRedirectTargets(command: string): ExtractedTarget[] {
+	const targets: ExtractedTarget[] = [];
+	const stripped = stripQuotedStrings(command);
+
+	function captureTarget(str: string, startIdx: number): string | undefined {
+		let i = startIdx;
+		while (i < str.length && str[i] === " ") i++;
+		if (i >= str.length) return undefined;
+		const q = str[i];
+		if (q === '"' || q === "'") {
+			const close = str.indexOf(q, i + 1);
+			if (close === -1) return undefined;
+			return str.slice(i + 1, close);
+		}
+		let end = i;
+		while (end < str.length && !/[\s|;&]/.test(str[end])) end++;
+		return str.slice(i, end);
+	}
+
+	const teeRe = /\btee\b/g;
+	let teeMatch: RegExpExecArray | null;
+	while ((teeMatch = teeRe.exec(stripped)) !== null) {
+		let i = teeMatch.index + 3;
+		while (i < command.length && command[i] === " ") i++;
+		if (command[i] === "-" && command[i + 1] === "a") {
+			i += 2;
+			while (i < command.length && command[i] === " ") i++;
+		}
+		const target = captureTarget(command, i);
+		if (target !== undefined && target.length > 0 && !NON_FILE_TARGET.test(target) && !/^\d+$/.test(target)) {
+			targets.push({ target, operator: "tee" });
+		}
+	}
+
+	const redirectRe = /(>>?)\|?(?!\s*&)/g;
+	let redirectMatch: RegExpExecArray | null;
+	while ((redirectMatch = redirectRe.exec(stripped)) !== null) {
+		const operator = redirectMatch[1]! as ">" | ">>";
+		const target = captureTarget(command, redirectMatch.index + redirectMatch[0].length);
+		if (target !== undefined && target.length > 0 && !NON_FILE_TARGET.test(target) && !/^\d+$/.test(target)) {
+			targets.push({ target, operator });
+		}
+	}
+	return targets;
+}
+
+function isSafeTarget(target: string, cwd?: string): boolean {
+	if (/^\d+$/.test(target)) return true;
+	if (NON_FILE_TARGET.test(target)) return true;
+	if (!cwd) {
+		return !target.startsWith("/");
+	}
+	const resolved = resolve(cwd, target);
+	const cwdResolved = resolve(cwd);
+	return resolved === cwdResolved || resolved.startsWith(cwdResolved + "/");
+}
+
+const INHERENTLY_MUTATING: { re: RegExp; hint: string }[] = [
+	{ re: /\bsed\b[^|]*-[a-z]*i/, hint: "in-place sed edit" },
+	{ re: /\bawk\b[^|]*?>\s*[^&\s]/, hint: "awk redirect to file" },
+	{ re: /\bperl\b[^|]*-[a-z]*i/, hint: "perl -i in-place edit" },
+	{ re: /\bdd\b[^|]*\bof=/, hint: "dd write to file (use edit/write)" },
+	{ re: /\btruncate\b/, hint: "truncate (in-place file mutation)" },
+	{ re: /\b(?:cp|mv|install)\b\s/, hint: "file copy/move (use edit/write)" },
 ];
 
-function classifyBash(command: string): { block: boolean; hint?: string } {
-	for (const { re, hint, targetGroup } of MUTATING_BASH) {
-		const m = re.exec(command);
-		if (!m) continue;
-		if (targetGroup !== undefined) {
-			const target = m[targetGroup];
-			if (target && NON_FILE_TARGET.test(target)) continue;
+function classifyBash(command: string, cwd?: string): { block: boolean; hint?: string } {
+	const stripped = stripQuotedStrings(command);
+	for (const { re, hint } of INHERENTLY_MUTATING) {
+		if (re.test(stripped)) {
+			return { block: true, hint };
 		}
-		return { block: true, hint };
+	}
+	const targets = extractRedirectTargets(command);
+	for (const { target, operator } of targets) {
+		if (!isSafeTarget(target, cwd)) {
+			const opHint = operator === "tee" ? "tee into" : "redirect into";
+			return {
+				block: true,
+				hint: `${opHint} a file outside the project: ${target}`,
+			};
+		}
 	}
 	return { block: false };
 }
@@ -82,32 +172,40 @@ describe("classifyBash", () => {
 		});
 	});
 
-	it("blocks echo redirect to file", () => {
-		expect(classifyBash('echo "hello" > output.txt')).toEqual({
+	it("blocks echo redirect outside project", () => {
+		expect(classifyBash('echo "hello" > /etc/passwd', "/home/user/project")).toEqual({
 			block: true,
-			hint: "shell redirect into a file",
+			hint: "redirect into a file outside the project: /etc/passwd",
 		});
 	});
 
-	it("blocks echo append to file", () => {
-		expect(classifyBash('echo "hello" >> output.txt')).toEqual({
+	it("blocks echo append outside project", () => {
+		expect(classifyBash('echo "hello" >> /etc/passwd', "/home/user/project")).toEqual({
 			block: true,
-			hint: "shell redirect into a file",
+			hint: "redirect into a file outside the project: /etc/passwd",
 		});
 	});
 
-	it("blocks tee to file", () => {
-		expect(classifyBash("cat input.txt | tee output.txt")).toEqual({
+	it("blocks tee to file outside project", () => {
+		expect(classifyBash("cat input.txt | tee /var/log/secret.log", "/home/user/project")).toEqual({
 			block: true,
-			hint: "tee into a file",
+			hint: "tee into a file outside the project: /var/log/secret.log",
 		});
 	});
 
-	it("blocks tee -a to file", () => {
-		expect(classifyBash("cat input.txt | tee -a output.txt")).toEqual({
+	it("blocks tee -a to file outside project", () => {
+		expect(classifyBash("cat input.txt | tee -a /var/log/secret.log", "/home/user/project")).toEqual({
 			block: true,
-			hint: "tee into a file",
+			hint: "tee into a file outside the project: /var/log/secret.log",
 		});
+	});
+
+	it("allows echo redirect inside project", () => {
+		expect(classifyBash('echo "hello" > output.txt', "/home/user/project")).toEqual({ block: false });
+	});
+
+	it("allows tee to file inside project", () => {
+		expect(classifyBash("cat input.txt | tee logs/test.log", "/home/user/project")).toEqual({ block: false });
 	});
 
 	// --- Allowed: read-only operations ---
@@ -160,6 +258,40 @@ describe("classifyBash", () => {
 	it("allows tee to /dev/null", () => {
 		expect(classifyBash("cat input.txt | tee /dev/null")).toEqual({ block: false });
 	});
+
+	// --- New classifyBash features ---
+
+	it("does not block redirect inside quoted string", () => {
+		expect(classifyBash('echo "hello > world"')).toEqual({ block: false });
+	});
+
+	it("blocks dd write to file", () => {
+		expect(classifyBash("dd if=/dev/zero of=file.bin")).toEqual({
+			block: true,
+			hint: "dd write to file (use edit/write)",
+		});
+	});
+
+	it("blocks truncate", () => {
+		expect(classifyBash("truncate -s 0 file.txt")).toEqual({
+			block: true,
+			hint: "truncate (in-place file mutation)",
+		});
+	});
+
+	it("blocks cp", () => {
+		expect(classifyBash("cp src.txt dst.txt")).toEqual({
+			block: true,
+			hint: "file copy/move (use edit/write)",
+		});
+	});
+
+	it("blocks mv", () => {
+		expect(classifyBash("mv src.txt dst.txt")).toEqual({
+			block: true,
+			hint: "file copy/move (use edit/write)",
+		});
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -167,22 +299,25 @@ describe("classifyBash", () => {
 // ---------------------------------------------------------------------------
 
 describe("source code structure", () => {
-	const src = readFileSync("/Users/yeshao/headroom/pi-edit/src/index.ts", "utf-8");
+	const src = readFileSync(join(__dirname, "../src/index.ts"), "utf-8");
+	it("registers the no-diagnostics flag", () => {
+		expect(src).toContain('registerFlag("pi-edit-no-diagnostics"');
+	});
 
 	it("exports a default function (Pi extension entry)", () => {
 		expect(src).toMatch(/export default function\s*\(/);
 	});
 
 	it("registers the no-readguard flag", () => {
-		expect(src).toContain('registerFlag("no-readguard"');
+		expect(src).toContain('registerFlag("pi-edit-no-readguard"');
 	});
 
 	it("registers the no-bashguard flag", () => {
-		expect(src).toContain('registerFlag("no-bashguard"');
+		expect(src).toContain('registerFlag("pi-edit-no-bashguard"');
 	});
 
-	it("registers the no-diagnostics flag", () => {
-		expect(src).toContain('registerFlag("no-diagnostics"');
+	it("registers the no-diagnostics flag (pi-edit prefix)", () => {
+		expect(src).toContain('registerFlag("pi-edit-no-diagnostics"');
 	});
 
 	it("hooks into tool_call for edit/write gating", () => {

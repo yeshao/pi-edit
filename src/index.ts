@@ -10,13 +10,15 @@
  *   2. TOCTOU protection              (mtime + content hash staleness check)
  *   3. sed/awk/echo-redirect steering (bash command inspection + soft block)
  *   4. Post-edit diagnostics loop     (lint/typecheck → append to tool result)
+ *   5. Schema-error recovery hints    (intercepts Pi's edit schema validation
+ *                                      failure and suggests `write` instead)
  *
  * Usage:  pi install npm:pi-edit
  *
  * Flags:
- *   --no-readguard        disable read-before-write + TOCTOU
- *   --no-bashguard        disable sed/awk steering
- *   --no-diagnostics      disable post-edit lint/typecheck feedback
+ *   --pi-edit-no-readguard        disable read-before-write + TOCTOU
+ *   --pi-edit-no-bashguard        disable sed/awk steering
+ *   --pi-edit-no-diagnostics      disable post-edit lint/typecheck feedback
  */
 
 import type {
@@ -40,28 +42,39 @@ interface ReadRecord {
 	absPath: string;
 	/** true when the model read the whole file (no offset/limit) */
 	fullRead: boolean;
+	/** Promise inflight for content-hash computation — deduplicates concurrent hash reads within a record */
+	hashPromise?: Promise<string | undefined>;
 }
 
-const readState = new Map<string, ReadRecord>();
+interface ReadState {
+	readState: Map<string, ReadRecord>;
+	rememberRead: (abs: string, record: ReadRecord) => void;
+}
 
-/** Cap the read-tracking map so a long session can't accumulate stale entries. */
-const MAX_READ_ENTRIES = 512;
+function createReadState(): ReadState {
+	const readState = new Map<string, ReadRecord>();
 
-function rememberRead(abs: string, record: ReadRecord): void {
-	// LRU-ish: re-insert moves the key to the end; evict from the front when full.
-	readState.delete(abs);
-	readState.set(abs, record);
-	if (readState.size > MAX_READ_ENTRIES) {
-		const oldest = readState.keys().next().value;
-		if (oldest !== undefined) readState.delete(oldest);
+	/** Cap the read-tracking map so a long session can't accumulate stale entries. */
+	const MAX_READ_ENTRIES = 512;
+
+	function rememberRead(abs: string, record: ReadRecord): void {
+		// LRU-ish: re-insert moves the key to the end; evict from the front when full.
+		readState.delete(abs);
+		readState.set(abs, record);
+		if (readState.size > MAX_READ_ENTRIES) {
+			const oldest = readState.keys().next().value;
+			if (oldest !== undefined) readState.delete(oldest);
+		}
 	}
+
+	return { readState, rememberRead };
 }
 
 function keyFor(cwd: string, path: string): string {
 	return resolve(cwd, path);
 }
 
-function hashOf(content: string): string {
+function hashOf(content: string | Buffer): string {
 	return createHash("sha256").update(content).digest("hex");
 }
 
@@ -77,27 +90,55 @@ async function snapshotFile(
 	try {
 		const st = await fsStat(absPath);
 		return { mtimeMs: st.mtimeMs, absPath, fullRead };
-	} catch {
-		return undefined;
+	} catch (e: unknown) {
+		// Only ENOENT means "file does not exist" (truly new). Any other stat
+		// error (EACCES, EMFILE, EIO, ELOOP, ...) means the file may exist but
+		// we can't inspect it — the gate must fail closed, not treat it as new.
+		if (
+			e !== null &&
+			typeof e === "object" &&
+			"code" in e &&
+			(e as { code: unknown }).code === "ENOENT"
+		) {
+			return undefined;
+		}
+		return { mtimeMs: -1, absPath, fullRead };
 	}
 }
 
-/** Compute (and memoize) the sha256 of a record's file. Returns undefined if unreadable. */
+/** Compute (and memoize) the sha256 of a record's file. Returns undefined if unreadable.
+ *
+ * Uses a Promise-based memo so that concurrent calls for the same record all
+ * await the same in-flight read instead of racing to set `contentHash`.
+ * Deduplicates within a single record; concurrent reads of the same file via
+ * separate records are not deduplicated.
+ */
 async function contentHashOf(record: ReadRecord): Promise<string | undefined> {
 	if (record.contentHash !== undefined) return record.contentHash;
-	try {
-		const buf = await readFile(record.absPath, "utf-8");
-		record.contentHash = hashOf(buf);
-		return record.contentHash;
-	} catch {
-		return undefined;
-	}
+	if (record.hashPromise !== undefined) return record.hashPromise;
+	record.hashPromise = (async () => {
+		try {
+			const buf = await readFile(record.absPath);
+			const hash = hashOf(buf);
+			record.contentHash = hash;
+			return hash;
+		} catch {
+			return undefined;
+		} finally {
+			delete record.hashPromise;
+		}
+	})();
+	return record.hashPromise;
 }
 
-/** Hash the file at a given absolute path without memoizing. Used for one-off reads. */
+/** Hash the file at a given absolute path without memoizing. Used for one-off reads.
+ *
+ * Returns undefined on read failure. The caller decides whether that means
+ * "file gone" (stale) or "unreadable" (I/O error).
+ */
 async function hashFileAt(absPath: string): Promise<string | undefined> {
 	try {
-		const buf = await readFile(absPath, "utf-8");
+		const buf = await readFile(absPath);
 		return hashOf(buf);
 	} catch {
 		return undefined;
@@ -106,62 +147,183 @@ async function hashFileAt(absPath: string): Promise<string | undefined> {
 
 /**
  * Decide whether `current` is stale relative to the recorded read.
- * Fast path: identical mtime ⇒ unchanged. Only when mtimes differ do we fall
- * back to a content hash (handles coarse-mtime filesystems / mtime-only touches).
  *
- * The recorded snapshot's hash MUST have been captured at read time (`record`
- * already carries it); the current on-disk hash is read here. If `record` has
- * no hash (read-time hashing was skipped) we can't disambiguate a coarse-mtime
- * change, so we treat the mtime difference as authoritative → stale (safe).
+ * When a recorded content hash is available we always hash-confirm — mtime
+ * alone is unreliable on coarse-granularity filesystems (HFS+ 1 s, FAT 2 s)
+ * and on same-tick writes (linter/formatter rewrites). The equal-mtime
+ * short-circuit is only safe when we have *no* hash to compare against.
+ *
+ * Safe invariant: contentHash is always populated by the read handler
+ * before rememberRead is called.
+ *
+ * Returns a discriminated tag so the caller can choose the right message:
+ *   "fresh"     — file unchanged, edit is safe
+ *   "changed"   — content or mtime differs, re-read needed
+ *   "unreadable" — stat or hash I/O failure, cannot verify
  */
+type StaleResult = "fresh" | "changed" | "unreadable";
 async function isStale(
 	record: ReadRecord,
 	current: ReadRecord,
-): Promise<boolean> {
-	if (record.mtimeMs === current.mtimeMs) return false;
-	if (record.contentHash === undefined) return true;
-	const now = await hashFileAt(current.absPath);
-	if (now === undefined) return true;
-	return record.contentHash !== now;
+): Promise<StaleResult> {
+	if (record.contentHash !== undefined) {
+		const now = await hashFileAt(current.absPath);
+		if (now === undefined) return "unreadable";
+		return record.contentHash !== now ? "changed" : "fresh";
+	}
+	// No recorded hash — fall back to mtime comparison.
+	if (record.mtimeMs === -1 || current.mtimeMs === -1) return "unreadable";
+	return record.mtimeMs !== current.mtimeMs ? "changed" : "fresh";
 }
 
 // ---------------------------------------------------------------------------
 // Bash command inspection — steer away from sed/awk file edits
+//
+// Inspired by Claude Code's approach: instead of blindly blocking all
+// redirects, we extract the redirect target and validate it against the
+// project directory. This allows safe patterns like:
+//   npm test > output.txt          (target inside project)
+//   cat file | tee logs/test.log   (target inside project)
+// While still blocking dangerous ones like:
+//   echo hello > /etc/passwd      (target outside project)
 // ---------------------------------------------------------------------------
 
-/**
- * Device/throwaway redirect targets that are NOT file edits and must not be blocked
- * (e.g. `cmd 2>/dev/null`, `cmd > /dev/null`, `cat x > /proc/...`).
- */
-const NON_FILE_TARGET = /^(?:\/dev\/|\/proc\/|\/sys\/)/;
+// /tmp and /var/tmp are scratch spaces — always permitted even when cwd is set,
+// since build tools and tests routinely write artifacts there.
+const NON_FILE_TARGET = /^(?:\/dev\/|\/proc\/|\/sys\/|\/tmp\/|\/var\/tmp\/)/;
+interface ExtractedTarget {
+	target: string;
+	operator: ">" | ">>" | "tee";
+}
 
 /**
- * Match a shell redirect into a *real file with an extension* and capture the target,
- * so we can exclude /dev, /proc, /sys and fd-only redirects (`2>&1`).
+ * Strip a single layer of surrounding quotes (single or double) from a string.
+ * Leaves the string unchanged if it is not fully wrapped in matching quotes.
  */
-const FILE_REDIRECT = />>?\s*([^&\s][^\s|;&]*\.\w+)/;
-/** tee into a real file (with extension), not `tee /dev/null` or `tee /proc/...`. */
-const FILE_TEE = /\btee\b\s+(?:-a\s+)?([^\s|;&]*\.\w+)/;
+function unquote(s: string): string {
+	const m = s.length >= 2 && s[0] === s[s.length - 1] && (s[0] === "'" || s[0] === '"');
+	return m ? s.slice(1, -1) : s;
+}
 
-/** Patterns that mutate files via the shell and should be redirected to edit/write. */
-const MUTATING_BASH: { re: RegExp; hint: string; targetGroup?: number }[] = [
-	{ re: /\bsed\b[^|]*\s-[a-z]*i/, hint: "in-place sed edit" },
-	{ re: /\bawk\b[^|]*>\s*[^&\s]/, hint: "awk redirect to file" },
-	{ re: /\bperl\b[^|]*\s-[a-z]*i/, hint: "perl -i in-place edit" },
-	{ re: FILE_REDIRECT, hint: "shell redirect into a file", targetGroup: 1 },
-	{ re: FILE_TEE, hint: "tee into a file", targetGroup: 1 },
+/**
+ * Remove quoted substrings (single- or double-quoted) from a command string,
+ * replacing them with an equal-length run of spaces. This prevents redirect
+ * operators *inside* a quoted string (e.g. `echo "a > b"`) from being
+ * matched, while preserving the positions of real redirects outside quotes.
+ */
+function stripQuotedStrings(command: string): string {
+	return command
+		.replace(/"(?:[^"\\]|\\.)*"/g, (m) => " ".repeat(m.length))
+		.replace(/'(?:[^'\\]|\\.)*'/g, (m) => " ".repeat(m.length));
+}
+
+function extractRedirectTargets(command: string): ExtractedTarget[] {
+	const targets: ExtractedTarget[] = [];
+	// Work on a copy with quoted strings blanked out so that > / >> / tee
+	// operators inside strings are never matched. Real redirects outside
+	// quotes are preserved with their position intact.
+	const stripped = stripQuotedStrings(command);
+
+	// Helper: extract target from the ORIGINAL command at a given position,
+	// handling quoted targets via unquote().
+	function captureTarget(str: string, startIdx: number): string | undefined {
+		// Skip whitespace after the operator.
+		let i = startIdx;
+		while (i < str.length && str[i] === " ") i++;
+		if (i >= str.length) return undefined;
+		// If the target starts with a quote, find the matching close quote.
+		const q = str[i];
+		if (q === '"' || q === "'") {
+			const close = str.indexOf(q, i + 1);
+			if (close === -1) return undefined;
+			return str.slice(i + 1, close);
+		}
+		// Unquoted target: read until the next whitespace, |, ;, or &.
+		let end = i;
+		while (end < str.length && !/[\s|;&]/.test(str[end])) end++;
+		return str.slice(i, end);
+	}
+
+	// Tee targets: match on stripped, extract from original.
+	// After "tee" we may see flag arguments (-a, --append, --ignore-interrupts, etc.)
+	// before the actual file target.
+	const teeRe = /\btee\b/g;
+	let teeMatch: RegExpExecArray | null;
+	while ((teeMatch = teeRe.exec(stripped)) !== null) {
+		let i = teeMatch.index + 3; // skip past "tee" in original
+		// Skip whitespace
+		while (i < command.length && command[i] === " ") i++;
+		// Skip flag arguments (-a, --append, --ignore-interrupts, etc.)
+		while (i < command.length && command[i] === "-") {
+			let end = i;
+			while (end < command.length && !/\s/.test(command[end])) end++;
+			i = end;
+			while (i < command.length && command[i] === " ") i++;
+		}
+		const target = captureTarget(command, i);
+		if (target !== undefined && target.length > 0 && !NON_FILE_TARGET.test(target) && !/^\d+$/.test(target)) {
+			targets.push({ target, operator: "tee" });
+		}
+	}
+
+	// Redirect targets: match >>? (with optional trailing |) on stripped,
+	// then capture the target from the ORIGINAL command.
+	// Use a negative lookahead for `&` to avoid matching fd redirects like 2>&1.
+	const redirectRe = /(>>?)\|?(?!\s*&)/g;
+	let redirectMatch: RegExpExecArray | null;
+	while ((redirectMatch = redirectRe.exec(stripped)) !== null) {
+		const operator = redirectMatch[1]! as ">" | ">>";
+		const target = captureTarget(command, redirectMatch.index + redirectMatch[0].length);
+		if (target !== undefined && target.length > 0 && !NON_FILE_TARGET.test(target) && !/^\d+$/.test(target)) {
+			targets.push({ target, operator });
+		}
+	}
+	return targets;
+}
+
+function isSafeTarget(target: string, cwd?: string): boolean {
+	if (/^\d+$/.test(target)) return true;
+	if (NON_FILE_TARGET.test(target)) return true;
+	if (!cwd) {
+		return !target.startsWith("/");
+	}
+	const resolved = resolve(cwd, target);
+	const cwdResolved = resolve(cwd);
+	return resolved === cwdResolved || resolved.startsWith(cwdResolved + "/");
+}
+
+const INHERENTLY_MUTATING: { re: RegExp; hint: string }[] = [
+	{ re: /\bsed\b[^|]*-[a-z]*i/, hint: "in-place sed edit" },
+	{ re: /\bawk\b[^|]*?>\s*[^&\s]/, hint: "awk redirect to file" },
+	{ re: /\bperl\b[^|]*-[a-z]*i/, hint: "perl -i in-place edit" },
+	// File-mutating commands that write without a > / >> / tee token.
+	{ re: /\bdd\b[^|]*\bof=/, hint: "dd write to file (use edit/write)" },
+	{ re: /\btruncate\b/, hint: "truncate (in-place file mutation)" },
+	{ re: /\b(?:cp|mv|install)\b\s/, hint: "file copy/move (use edit/write)" },
 ];
 
-/** Read-only sed/awk (sed -n 'Np', awk filters w/o redirect) is allowed. */
-function classifyBash(command: string): { block: boolean; hint?: string } {
-	for (const { re, hint, targetGroup } of MUTATING_BASH) {
-		const m = re.exec(command);
-		if (!m) continue;
-		if (targetGroup !== undefined) {
-			const target = m[targetGroup];
-			if (target && NON_FILE_TARGET.test(target)) continue;
+function classifyBash(
+	command: string,
+	cwd?: string,
+): { block: boolean; hint?: string } {
+	// Strip quoted strings before testing patterns so that > inside quotes
+	// (e.g. awk '{print ">"}') doesn't trigger a false positive, while
+	// awk '{print}'>file.txt still does.
+	const stripped = stripQuotedStrings(command);
+	for (const { re, hint } of INHERENTLY_MUTATING) {
+		if (re.test(stripped)) {
+			return { block: true, hint };
 		}
-		return { block: true, hint };
+	}
+	const targets = extractRedirectTargets(command);
+	for (const { target, operator } of targets) {
+		if (!isSafeTarget(target, cwd)) {
+			const opHint = operator === "tee" ? "tee into" : "redirect into";
+			return {
+				block: true,
+				hint: `${opHint} a file outside the project: ${target}`,
+			};
+		}
 	}
 	return { block: false };
 }
@@ -180,21 +342,23 @@ const DIAG_RUNNERS: DiagRunner[] = [
 		exts: [".ts", ".tsx"],
 		argv: (file) => ({
 			cmd: "npx",
-			args: ["--no-install", "eslint", "--format", "compact", file],
+			// "--" terminates option parsing so a file named "--fix" etc. is
+			// treated as a positional path, not consumed as an eslint flag.
+			args: ["--no-install", "eslint", "--format", "compact", "--", file],
 		}),
 	},
 	{
 		exts: [".js", ".jsx"],
 		argv: (file) => ({
 			cmd: "npx",
-			args: ["--no-install", "eslint", "--format", "compact", file],
+			args: ["--no-install", "eslint", "--format", "compact", "--", file],
 		}),
 	},
 	{
 		exts: [".py"],
 		argv: (file) => ({
 			cmd: "ruff",
-			args: ["check", "--output-format", "concise", file],
+			args: ["check", "--output-format", "concise", "--", file],
 		}),
 	},
 ];
@@ -203,50 +367,78 @@ function runnerFor(path: string): DiagRunner | undefined {
 	return DIAG_RUNNERS.find((r) => r.exts.some((e) => path.endsWith(e)));
 }
 
-const DIAG_DEBOUNCE_MS = 250;
-const diagInFlight = new Map<string, Promise<string | undefined>>();
-const diagLastRunAt = new Map<string, number>();
+function createDiagState() {
+	const DIAG_DEBOUNCE_MS = 250;
+	const MAX_DIAG_ENTRIES = 512;
+	const diagInFlight = new Map<string, Promise<string | undefined>>();
+	const diagLastRunAt = new Map<string, number>();
 
-async function runDiagnostics(
-	pi: ExtensionAPI,
-	cwd: string,
-	path: string,
-): Promise<string | undefined> {
-	const runner = runnerFor(path);
-	if (!runner) return undefined;
-	const spec = runner.argv(path);
-	if (!spec) return undefined;
+	async function runDiagnostics(
+		pi: ExtensionAPI,
+		cwd: string,
+		path: string,
+	): Promise<string | undefined> {
+		const runner = runnerFor(path);
+		if (!runner) return undefined;
+		const spec = runner.argv(path);
+		if (!spec) return undefined;
 
-	const abs = keyFor(cwd, path);
+		const abs = keyFor(cwd, path);
 
-	const inFlight = diagInFlight.get(abs);
-	if (inFlight) return inFlight;
+		const inFlight = diagInFlight.get(abs);
+		if (inFlight) return inFlight;
 
-	const last = diagLastRunAt.get(abs);
-	if (last !== undefined && Date.now() - last < DIAG_DEBOUNCE_MS)
-		return undefined;
-
-	const run = (async () => {
-		try {
-			const { stdout, stderr, code } = await pi.exec(spec.cmd, spec.args, {
-				cwd,
-				timeout: 30_000,
-			});
-			if (code === 0) return undefined;
-			const out = `${stdout}\n${stderr}`.trim();
-			if (!out) return undefined;
-			const lines = out.split("\n").slice(0, 30);
-			return lines.join("\n");
-		} catch {
+		const last = diagLastRunAt.get(abs);
+		if (last !== undefined && Date.now() - last < DIAG_DEBOUNCE_MS)
 			return undefined;
-		} finally {
-			diagLastRunAt.set(abs, Date.now());
-			diagInFlight.delete(abs);
-		}
-	})();
 
-	diagInFlight.set(abs, run);
-	return run;
+		const run = (async () => {
+			try {
+				const { stdout, stderr, code } = await pi.exec(spec.cmd, spec.args, {
+					cwd,
+					timeout: 30_000,
+				});
+				// Exit code 1 = lint findings (what we surface).
+				// Exit code 0 = clean. Exit code 2+ = tool crash / config error.
+				if (code !== 1) return undefined;
+
+				const out = `${stdout}\n${stderr}`.trim();
+				if (!out) return undefined;
+				return out.split("\n").slice(0, 30).join("\n");
+			} catch {
+				return undefined;
+			} finally {
+				diagLastRunAt.set(abs, Date.now());
+				if (diagLastRunAt.size > MAX_DIAG_ENTRIES) {
+					const oldest = diagLastRunAt.keys().next().value;
+					if (oldest !== undefined) diagLastRunAt.delete(oldest);
+				}
+				diagInFlight.delete(abs);
+			}
+		})();
+
+		diagInFlight.set(abs, run);
+		return run;
+	}
+
+	return { runDiagnostics };
+}
+
+// ---------------------------------------------------------------------------
+// Schema-error recovery patterns
+// ---------------------------------------------------------------------------
+/**
+ * Pi's tool schemas have `additionalProperties: false` but the framework may
+ * inject extra properties or the model may use wrong parameter names (e.g.
+ * `file` or `file_path` instead of `path`). These schema validation failures
+ * are intercepted so we can inject a recovery hint.
+ */
+const SCHEMA_ERROR_PATTERNS = [
+	/\broot:\s+must\s+(?:not\s+)?have\s+additional\s+properties?\b/i,
+	/\bpath:\s+must\s+have\s+required\s+propert(?:y|ies)\s+['"]?path['"]?\b/i,
+];
+function isSchemaValidationError(text: string): boolean {
+	return SCHEMA_ERROR_PATTERNS.some((p) => p.test(text));
 }
 
 // ---------------------------------------------------------------------------
@@ -254,63 +446,155 @@ async function runDiagnostics(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	pi.registerFlag("no-readguard", {
+	pi.registerFlag("pi-edit-no-readguard", {
 		type: "boolean",
 		default: false,
 		description: "disable read-before-write/TOCTOU",
 	});
-	pi.registerFlag("no-bashguard", {
+	pi.registerFlag("pi-edit-no-bashguard", {
 		type: "boolean",
 		default: false,
 		description: "disable sed/awk steering",
 	});
-	pi.registerFlag("no-diagnostics", {
+	pi.registerFlag("pi-edit-no-diagnostics", {
 		type: "boolean",
 		default: false,
 		description: "disable post-edit lint",
 	});
 
-	const readGuardOff = () => pi.getFlag("no-readguard") === true;
-	const bashGuardOff = () => pi.getFlag("no-bashguard") === true;
-	const diagOff = () => pi.getFlag("no-diagnostics") === true;
+	const readGuardOff = () => pi.getFlag("pi-edit-no-readguard") === true;
+	const bashGuardOff = () => pi.getFlag("pi-edit-no-bashguard") === true;
+	const diagOff = () => pi.getFlag("pi-edit-no-diagnostics") === true;
 
+	// Per-agent isolated state — each call to this extension function gets its
+	// own maps, so multiple agents in the same process don't share state.
+	const { readState, rememberRead } = createReadState();
+	const { runDiagnostics } = createDiagState();
+	// Module-level debounce map for partial-read warnings (not agent-specific).
+	const partialReadWarnAt = new Map<string, number>();
+	const MAX_PARTIAL_WARN_ENTRIES = 256;
 	function readPathOf(
 		input: Record<string, unknown>,
 		mode?: string,
 	): string | undefined {
-		const path = (input.path as string) ?? (input.file_path as string);
-		if (typeof path === "string" && path.length > 0) return path;
+		const p =
+			(input.path as string) ??
+			(input.file_path as string) ??
+			(input.file as string);
+		if (typeof p === "string" && p.length > 0) return p;
 		if (mode !== "tui") {
-			console.warn(
-				"[pi-edit] read event missing path/file_path; not tracked",
-				{ keys: Object.keys(input) },
-			);
+			console.warn("[pi-edit] read event missing path/file_path; not tracked", {
+				keys: Object.keys(input),
+			});
 		}
 		return undefined;
 	}
 
-	// 1. Track reads — capture baseline mtime AND content hash at read time.
+	// 1 & 3 & 4 & 5. Single tool_result handler — merges read tracking,
+	// post-edit diagnostics, and schema-error recovery into one registration
+	// so that Pi runtimes with last-write-wins pi.on() semantics cannot
+	// silently drop the read-tracking logic (which would permanently block
+	// every edit because readState would never be populated).
 	pi.on("tool_result", async (event, ctx) => {
-		if (event.toolName !== "read" || event.isError) return undefined;
+		// --- 1. Track reads: populate readState so edit/write gating works. ---
+		if (event.toolName === "read" && !event.isError) {
+			const path = readPathOf(event.input, ctx.mode);
+			if (path) {
+				const abs = keyFor(ctx.cwd, path);
+				const fullRead =
+					event.input.offset === undefined && event.input.limit === undefined;
+				const snap = await snapshotFile(abs, fullRead);
+				if (snap) {
+					await contentHashOf(snap);
+					rememberRead(abs, snap);
+				}
+			}
+			return undefined;
+		}
+
+		// --- 5. Schema-error recovery (read/edit/write) ---
+		if (event.isError) {
+			const blocks = Array.isArray(event.content) ? event.content : [];
+			const errorText = blocks
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+			if (errorText && isSchemaValidationError(errorText)) {
+				const path = readPathOf(event.input, ctx.mode);
+				let hint: string;
+				// Only the wrong-parameter-name case is a "soft" schema error
+				// we can safely downgrade to a success with a recovery hint.
+				// For other schema errors (e.g. the edit tool's `root` injection
+				// bug) we must preserve isError:true so the agent sees the failure.
+				const usedWrongKey =
+					event.input.path === undefined &&
+					(event.input.file_path !== undefined ||
+						event.input.file !== undefined);
+				if (event.toolName === "read" && usedWrongKey) {
+					hint =
+						`\n\n[recovery hint] Pi's 'read' tool requires the 'path' parameter ` +
+						`(not 'file' or 'file_path'). Retry with:\n` +
+						`  read path=${path ?? event.input.file_path ?? event.input.file}`;
+				} else if (event.toolName !== "read" && usedWrongKey) {
+					hint =
+						`\n\n[recovery hint] Pi's ${event.toolName} tool requires the 'path' parameter. ` +
+						`Retry with:\n` +
+						`  ${event.toolName} path=${path ?? event.input.file_path ?? event.input.file}`;
+				} else {
+					hint =
+						`\n\n[recovery hint] Pi's ${event.toolName} tool returned a schema ` +
+						`validation error. Review the error above before retrying.`;
+				}
+				// Requires Pi runtime to propagate async handler return values
+				// to the tool result.
+				return {
+					content: [
+						...(Array.isArray(event.content) ? event.content : []),
+						{ type: "text" as const, text: hint },
+					],
+					isError: usedWrongKey && event.toolName !== "read" ? false : true,
+				};
+			}
+			return undefined;
+		}
+
+		// --- 4. Post-edit diagnostics (edit/write successes only) ---
+		if (event.toolName !== "edit" && event.toolName !== "write")
+			return undefined;
 		const path = readPathOf(event.input, ctx.mode);
 		if (!path) return undefined;
+		// Always refresh readState to the post-edit baseline.
 		const abs = keyFor(ctx.cwd, path);
-		const fullRead =
-			event.input.offset === undefined && event.input.limit === undefined;
-		const snap = await snapshotFile(abs, fullRead);
+		const snap = await snapshotFile(abs, true);
 		if (snap) {
 			await contentHashOf(snap);
 			rememberRead(abs, snap);
 		}
-		return undefined;
+
+		if (diagOff()) return undefined;
+
+		const diag = await runDiagnostics(pi, ctx.cwd, path);
+		if (!diag) return undefined;
+
+		const note = `\n\n[diagnostics for ${path} — fix before continuing]\n${diag}`;
+		return {
+			content: [
+				...(Array.isArray(event.content) ? event.content : []),
+				{ type: "text" as const, text: note },
+			],
+			isError: false,
+		};
 	});
 
 	// 2. Gate edit/write — read-before-write + TOCTOU.
 	pi.on("tool_call", async (event, ctx) => {
 		// --- bash steering ---
 		if (event.toolName === "bash" && !bashGuardOff()) {
-			const bashEvent = event as Extract<ToolCallEvent, { toolName: "bash" }>;
-			const { block, hint } = classifyBash(bashEvent.input.command ?? "");
+			const bashEvent = event as unknown as ToolCallEvent;
+			const { block, hint } = classifyBash(
+				(bashEvent.input.command as string) ?? "",
+				ctx.cwd,
+			);
 			if (block) {
 				return {
 					block: true,
@@ -347,51 +631,34 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// TOCTOU: file changed since the model last read it.
-		if (record && (await isStale(record, current))) {
+		if (!record) return undefined; // write without prior read: no TOCTOU to check
+		const stale = await isStale(record, current);
+		if (stale !== "fresh") {
 			readState.delete(abs);
-			return {
-				block: true,
-				reason:
-					`${path} has changed on disk since you last read it (external edit, linter, or another process). ` +
-					`Re-read it with the 'read' tool and recompute your edits before applying.`,
-			};
+			const reason =
+				stale === "unreadable"
+					? `${path} could not be verified as unchanged (read error). ` +
+						`Re-read it before editing to confirm the current contents.`
+					: `${path} has changed on disk since you last read it (external edit, linter, or another process). ` +
+						`Re-read it with the 'read' tool and recompute your edits before applying.`;
+			return { block: true, reason };
 		}
 
-		// Partial-read warning
+		// Partial-read warning (debounced to avoid spam)
 		if (event.toolName === "edit" && record && !record.fullRead) {
-			console.warn(
-				`[pi-edit] editing ${path} after a partial read; model may lack full-file context`,
-			);
+			const lastWarn = partialReadWarnAt.get(abs);
+			if (lastWarn === undefined || Date.now() - lastWarn > 60_000) {
+				console.warn(
+					`[pi-edit] editing ${path} after a partial read; model may lack full-file context`,
+				);
+				partialReadWarnAt.set(abs, Date.now());
+				if (partialReadWarnAt.size > MAX_PARTIAL_WARN_ENTRIES) {
+					const oldest = partialReadWarnAt.keys().next().value;
+					if (oldest !== undefined) partialReadWarnAt.delete(oldest);
+				}
+			}
 		}
 
 		return undefined;
-	});
-
-	// 3. Post-edit diagnostics loop.
-	pi.on("tool_result", async (event, ctx) => {
-		if (event.toolName !== "edit" && event.toolName !== "write")
-			return undefined;
-		if (event.isError) return undefined;
-		const path = readPathOf(event.input, ctx.mode);
-		if (!path) return undefined;
-
-		// Always refresh readState to the post-edit baseline.
-		const abs = keyFor(ctx.cwd, path);
-		const snap = await snapshotFile(abs, true);
-		if (snap) {
-			await contentHashOf(snap);
-			rememberRead(abs, snap);
-		}
-
-		if (diagOff()) return undefined;
-
-		const diag = await runDiagnostics(pi, ctx.cwd, path);
-		if (!diag) return undefined;
-
-		const note = `\n\n[diagnostics for ${path} — fix before continuing]\n${diag}`;
-		return {
-			content: [...event.content, { type: "text" as const, text: note }],
-			isError: false,
-		};
 	});
 }
