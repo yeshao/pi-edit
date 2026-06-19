@@ -6,7 +6,7 @@ Brings Claude Code's editing safety optimizations to Pi **without removing** wha
 
 ## What It Does
 
-Pi-edit adds four safety layers via event hooks (no tool overrides):
+Pi-edit adds five safety layers via event hooks (no tool overrides):
 
 1. **Read-before-write enforcement** — tracks which files the model has read; blocks `edit` on unread files so `oldText` always matches current contents.
 
@@ -16,19 +16,25 @@ Pi-edit adds four safety layers via event hooks (no tool overrides):
 
 4. **Post-edit diagnostics** — after each successful `edit` or `write`, runs a fast linter (`eslint` for TS/JS, `ruff` for Python) and appends results to the tool output so the model can fix issues before continuing. Includes debouncing and in-flight deduplication.
 
+5. **Schema-error recovery hints** — intercepts Pi's edit schema validation failures (e.g. wrong parameter names like `file` or `file_path` instead of `path`) and appends a recovery hint to the tool result suggesting the correct parameter name.
+
 ## Installation
 
 ```bash
+# Via npm (recommended)
 pi install npm:pi-edit
+
+# Via GitHub URL (fallback)
+pi install https://github.com/yeshao/pi-edit
 ```
 
 ## Flags
 
 | Flag | Description |
 |------|-------------|
-| `--no-readguard` | Disable read-before-write + TOCTOU |
-| `--no-bashguard` | Disable sed/awk steering |
-| `--no-diagnostics` | Disable post-edit lint/typecheck feedback |
+| `--pi-edit-no-readguard` | Disable read-before-write + TOCTOU |
+| `--pi-edit-no-bashguard` | Disable sed/awk steering |
+| `--pi-edit-no-diagnostics` | Disable post-edit lint/typecheck feedback |
 
 ## How It Works
 
@@ -79,9 +85,9 @@ pi-edit/
 ├── vitest.config.ts
 ├── README.md
 ├── src/
-│   └── index.ts          # Extension entry (452 lines)
+│   └── index.ts          # Extension entry (~580 lines)
 └── tests/
-    └── classify-bash.test.ts  # 34 tests
+    └── classify-bash.test.ts  # 58 tests
 ```
 
 ## Development
