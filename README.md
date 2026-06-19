@@ -52,12 +52,22 @@ Model calls edit("file.txt", edits=[...])
 
 ### TOCTOU detection
 
-Fast path: identical mtime = unchanged (no hash needed).
-Slow path: mtime differs = compute content hash and compare with read-time baseline.
+Every read records a **sha256 content hash** of the file alongside its mtime.
+
+- **Fresh**: current hash matches recorded hash → file unchanged, edit allowed.
+- **Changed**: hash differs → file was modified since last read → block and require re-read.
+- **Unreadable**: file can't be hashed (I/O error) → fail closed, require re-read.
+
+The mtime is captured but not trusted alone — coarse-grained filesystems (HFS+ 1s, FAT 2s) and same-tick writes (linter rewrites) make mtime unreliable. The content hash is the source of truth.
 
 ### Bash steering
 
-Only blocks file-mutating shell commands. Read-only inspection is always allowed.
+Two detection strategies:
+
+1. **Inherently mutating patterns** — blocks `sed -i`, `awk > file`, `perl -i`, `dd of=`, `truncate`, and `cp`/`mv`/`install` with file arguments.
+2. **Redirect target analysis** — extracts `>`, `>>`, and `tee` targets from the command, strips quoted strings to avoid false positives (e.g. `echo "a > b"`), and blocks writes outside the project directory.
+
+Read-only inspection (`sed -n 'Np'`, `awk` filters without redirect) is always allowed. Scratch spaces (`/tmp`, `/var/tmp`) are permitted.
 
 ### Post-edit diagnostics
 
@@ -70,7 +80,24 @@ Model calls edit("src/foo.ts", ...)
      3:10  error  'x' is defined but never used  @typescript-eslint/no-unused-vars
 ```
 
+Supported: **eslint** for `.ts`/`.tsx`/`.js`/`.jsx`, **ruff** for `.py`.
+
 Debounced at 250ms per file; shared in-flight runs; 30s timeout ceiling.
+
+## How It Works — Schema-error recovery
+
+When Pi's tool schema validation fails (e.g. the model uses `file` or `file_path` instead of `path`), pi-edit intercepts the error and appends a recovery hint:
+
+```
+[recovery hint] Pi's 'edit' tool requires the 'path' parameter.
+  Retry with: edit path=src/foo.ts
+```
+
+For wrong-parameter-name errors on `read`/`edit`/`write`, the error is downgraded to a success with the hint so the agent can self-correct without wasting a turn.
+
+## Partial-read warnings
+
+If the model calls `edit` on a file that was only partially read (with `offset`/`limit`), pi-edit logs a warning that the model may lack full-file context. Debounced to once per minute per file.
 
 ## Dependencies
 
